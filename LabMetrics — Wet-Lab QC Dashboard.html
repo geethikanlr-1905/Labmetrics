@@ -1,0 +1,1494 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>LabMetrics — Wet-Lab QC Dashboard</title>
+
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+
+<style>
+  :root {
+    --bg: #f8fafc;
+    --panel: #ffffff;
+    --border: #e2e8f0;
+    --ink: #0f172a;
+    --muted: #64748b;
+    --primary: #0891b2;
+    --primary-dark: #0e7490;
+    --accent: #10b981;
+    --warn: #f59e0b;
+    --fail: #e11d48;
+  }
+  html, body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    margin: 0;
+    -webkit-font-smoothing: antialiased;
+  }
+  .mono { font-family: 'JetBrains Mono', 'SF Mono', Consolas, Monaco, monospace; }
+  .scrollbar-thin::-webkit-scrollbar { width: 6px; height: 6px; }
+  .scrollbar-thin::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+  .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+  .nav-item { transition: all 0.15s ease; }
+  .nav-item.active {
+    background: var(--primary);
+    color: white;
+    box-shadow: 0 1px 3px rgba(8,145,178,0.3);
+  }
+  .kpi-card { transition: transform 0.15s ease, box-shadow 0.15s ease; }
+  .kpi-card:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.06); }
+  .btn { transition: all 0.15s ease; }
+  .btn:active { transform: scale(0.98); }
+  input, select, textarea {
+    font-family: inherit;
+  }
+  .status-pass { background: #d1fae5; color: #065f46; }
+  .status-warn { background: #fef3c7; color: #92400e; }
+  .status-fail { background: #fee2e2; color: #991b1b; }
+  .pulse-dot {
+    display: inline-block;
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: #10b981;
+    box-shadow: 0 0 0 0 rgba(16,185,129,0.7);
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(16,185,129,0.7); }
+    70% { box-shadow: 0 0 0 8px rgba(16,185,129,0); }
+    100% { box-shadow: 0 0 0 0 rgba(16,185,129,0); }
+  }
+  .toast-enter { animation: slideIn 0.25s ease-out; }
+  @keyframes slideIn {
+    from { transform: translateX(120%); opacity: 0; }
+    to { transform: translateX(0); opacity: 1; }
+  }
+  .tab-active {
+    border-bottom: 2px solid var(--primary);
+    color: var(--primary);
+    font-weight: 600;
+  }
+  table.lab-data { border-collapse: collapse; width: 100%; font-size: 13px; }
+  table.lab-data th {
+    text-align: left;
+    background: #f1f5f9;
+    padding: 8px 12px;
+    border-bottom: 2px solid #cbd5e1;
+    font-weight: 600;
+    color: #475569;
+    text-transform: uppercase;
+    font-size: 11px;
+    letter-spacing: 0.05em;
+  }
+  table.lab-data td {
+    padding: 8px 12px;
+    border-bottom: 1px solid #e2e8f0;
+  }
+  table.lab-data tr:hover { background: #f8fafc; }
+  .lj-chart { background: #ffffff; }
+  .grid-bg {
+    background-image:
+      linear-gradient(rgba(0,0,0,0.04) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,0,0,0.04) 1px, transparent 1px);
+    background-size: 40px 40px;
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useMemo, useRef, useCallback } = React;
+
+/* ============================================================
+   STORAGE HELPERS
+   ============================================================ */
+const STORE_KEYS = {
+  runs: 'labmetrics_runs',
+  qc: 'labmetrics_qccontrols',
+  audit: 'labmetrics_audit',
+  settings: 'labmetrics_settings',
+};
+
+const loadJSON = (key, fallback) => {
+  try {
+    const v = localStorage.getItem(key);
+    return v ? JSON.parse(v) : fallback;
+  } catch { return fallback; }
+};
+const saveJSON = (key, val) => localStorage.setItem(key, JSON.stringify(val));
+
+/* ============================================================
+   UTILITIES
+   ============================================================ */
+const uid = () => Math.random().toString(36).slice(2, 10);
+const nowISO = () => new Date().toISOString();
+const fmtDate = (d) => new Date(d).toLocaleDateString('en-US', { year:'numeric', month:'short', day:'2-digit' });
+const fmtDateTime = (d) => new Date(d).toLocaleString('en-US', { year:'numeric', month:'short', day:'2-digit', hour:'2-digit', minute:'2-digit' });
+const daysAgo = (n) => { const d = new Date(); d.setDate(d.getDate()-n); return d.toISOString(); };
+const mean = (arr) => arr.length ? arr.reduce((a,b)=>a+b,0)/arr.length : 0;
+const stdev = (arr) => {
+  if (arr.length < 2) return 0;
+  const m = mean(arr);
+  return Math.sqrt(arr.reduce((s,x)=>s+(x-m)**2,0)/(arr.length-1));
+};
+const round = (n, d=3) => Number(n.toFixed(d));
+
+function linearRegression(points) {
+  const n = points.length;
+  if (n < 2) return { slope: 0, intercept: mean(points.map(p=>p.y)), r2: 0 };
+  const sx = points.reduce((s,p)=>s+p.x,0);
+  const sy = points.reduce((s,p)=>s+p.y,0);
+  const sxy = points.reduce((s,p)=>s+p.x*p.y,0);
+  const sx2 = points.reduce((s,p)=>s+p.x*p.x,0);
+  const sy2 = points.reduce((s,p)=>s+p.y*p.y,0);
+  const slope = (n*sxy - sx*sy) / (n*sx2 - sx*sx);
+  const intercept = (sy - slope*sx) / n;
+  const yMean = sy/n;
+  const ssTot = points.reduce((s,p)=>s+(p.y-yMean)**2,0);
+  const ssRes = points.reduce((s,p)=>s+(p.y - (slope*p.x + intercept))**2,0);
+  const r2 = ssTot > 0 ? 1 - ssRes/ssTot : 0;
+  return { slope, intercept, r2 };
+}
+
+function zPrime(posArr, negArr) {
+  const mp = mean(posArr), mn = mean(negArr);
+  const sp = stdev(posArr), sn = stdev(negArr);
+  const denom = Math.abs(mp - mn);
+  if (denom === 0) return { z: 0, mp, mn, sp, sn };
+  const z = 1 - (3 * (sp + sn)) / denom;
+  return { z, mp, mn, sp, sn };
+}
+
+function zPrimeQuality(z) {
+  if (z < 0) return { label: 'Fail', color: 'status-fail' };
+  if (z < 0.5) return { label: 'Marginal', color: 'status-fail' };
+  if (z < 0.7) return { label: 'Acceptable', color: 'status-warn' };
+  return { label: 'Excellent', color: 'status-pass' };
+}
+
+function westgardViolations(values, dates) {
+  if (values.length < 2) return [];
+  const m = mean(values);
+  const sd = stdev(values);
+  if (sd === 0) return [];
+  const deviations = values.map(v => (v - m) / sd);
+  const violations = [];
+  
+  // 1_3s
+  deviations.forEach((d, i) => {
+    if (Math.abs(d) > 3) {
+      violations.push({ rule: '1_3s', indices: [i], severity: 'fail',
+        msg: `Point ${i+1} exceeds ±3SD (${d.toFixed(2)}σ)` });
+    }
+  });
+  // 2_2s
+  for (let i = 1; i < deviations.length; i++) {
+    if (Math.abs(deviations[i-1]) > 2 && Math.abs(deviations[i]) > 2 &&
+        Math.sign(deviations[i-1]) === Math.sign(deviations[i])) {
+      violations.push({ rule: '2_2s', indices: [i-1, i], severity: 'fail',
+        msg: `Two consecutive >±2SD (points ${i}, ${i+1})` });
+    }
+  }
+  // R_4s
+  for (let i = 1; i < deviations.length; i++) {
+    if (Math.abs(deviations[i] - deviations[i-1]) > 4) {
+      violations.push({ rule: 'R_4s', indices: [i-1, i], severity: 'fail',
+        msg: `Range >4SD between points ${i}, ${i+1}` });
+    }
+  }
+  // 4_1s
+  for (let i = 3; i < deviations.length; i++) {
+    const w = deviations.slice(i-3, i+1);
+    if (w.every(d => Math.abs(d) > 1) && w.every(d => Math.sign(d) === Math.sign(w[0]))) {
+      violations.push({ rule: '4_1s', indices: [i-3, i], severity: 'warn',
+        msg: `Four consecutive >±1SD (points ${i-2}..${i+1})` });
+    }
+  }
+  // 10_x
+  for (let i = 9; i < deviations.length; i++) {
+    const w = deviations.slice(i-9, i+1);
+    if (w.every(d => Math.sign(d) === Math.sign(w[0]))) {
+      violations.push({ rule: '10_x', indices: [i-9, i], severity: 'warn',
+        msg: `Ten consecutive on same side of mean (points ${i-8}..${i+1})` });
+    }
+  }
+  return violations;
+}
+
+/* ============================================================
+   DEMO DATA SEEDING
+   ============================================================ */
+function seedDemoData() {
+  const operators = ['JD', 'MK', 'AS', 'RP', 'TL'];
+  const batches = ['L2401-A', 'L2401-B', 'L2402-A', 'L2402-B', 'L2403-A'];
+  const runs = [];
+  const qcControls = [];
+  const audit = [];
+
+  const qcDefs = [
+    { assayType: 'Cell Viability', level: 'QC High', mean: 95, sd: 2.0 },
+    { assayType: 'Cell Viability', level: 'QC Low',  mean: 65, sd: 3.0 },
+    { assayType: 'Flow Cytometry', level: 'QC High', mean: 78, sd: 2.5 },
+    { assayType: 'Flow Cytometry', level: 'QC Low',  mean: 12, sd: 1.8 },
+    { assayType: 'ELISA', level: 'QC High', mean: 850, sd: 35 },
+    { assayType: 'ELISA', level: 'QC Low', mean: 120, sd: 12 },
+    { assayType: 'qPCR', level: 'QC High', mean: 22.5, sd: 0.4 },
+    { assayType: 'qPCR', level: 'QC Low',  mean: 28.0, sd: 0.5 },
+  ];
+  qcDefs.forEach((d, idx) => {
+    const values = [];
+    for (let i = 0; i < 30; i++) {
+      const drift = (i > 20 ? 0.3*(i-20) : 0);
+      const value = d.mean + (Math.random()-0.5)*2*d.sd + drift;
+      values.push({ date: daysAgo(29-i), value: round(value, 3) });
+    }
+    qcControls.push({ id: `qc_${idx}`, name: `${d.assayType} ${d.level}`,
+      assayType: d.assayType, level: d.level,
+      targetMean: d.mean, targetSD: d.sd, values });
+  });
+
+  for (let i = 0; i < 60; i++) {
+    const numRuns = 1 + Math.floor(Math.random()*3);
+    for (let j = 0; j < numRuns; j++) {
+      const assayIdx = Math.floor(Math.random()*4);
+      const assay = ['Cell Viability','Flow Cytometry','ELISA','qPCR'][assayIdx];
+      const ts = daysAgo(59-i);
+      const op = operators[Math.floor(Math.random()*operators.length)];
+      const batch = batches[Math.floor(Math.random()*batches.length)];
+      const sid = `${assay.replace(/\s/g,'').slice(0,3).toUpperCase()}-${(1000+i*3+j).toString()}`;
+      let values = {};
+      switch(assay) {
+        case 'Cell Viability':
+          values = { viability: round(70 + Math.random()*28, 1),
+            totalCells: Math.round(500000 + Math.random()*1500000) };
+          break;
+        case 'Flow Cytometry':
+          values = { marker: ['CD3','CD4','CD8','CD19'][Math.floor(Math.random()*4)],
+            pctPositive: round(5 + Math.random()*85, 2),
+            mfi: Math.round(500 + Math.random()*5000) };
+          break;
+        case 'ELISA':
+          values = { plateId: `P-${(100+i).toString()}`,
+            well: `${String.fromCharCode(65+Math.floor(Math.random()*8))}${1+Math.floor(Math.random()*12)}`,
+            od450: round(0.1 + Math.random()*2.5, 4),
+            concentration: round(50 + Math.random()*2000, 2) };
+          break;
+        case 'qPCR':
+          const ctT = round(20 + Math.random()*10, 2);
+          const ctH = round(18 + Math.random()*2, 2);
+          values = { target: ['GAPDH','ACTB','TNF','IL6','BRCA1'][Math.floor(Math.random()*5)],
+            ctTarget: ctT, ctHousekeeping: ctH, deltaCt: round(ctT - ctH, 2),
+            efficiency: round(0.85 + Math.random()*0.15, 3) };
+          break;
+      }
+      runs.push({
+        id: uid(), timestamp: ts, assayType: assay, sampleId: sid,
+        batch, operator: op, values, qcFlags: []
+      });
+    }
+  }
+
+  qcControls[0].values[25].value = 99.5;
+  qcControls[0].values[26].value = 98.8;
+
+  audit.push({
+    timestamp: nowISO(), action: 'SEED_DEMO',
+    user: 'System', details: `Seeded ${runs.length} runs, ${qcControls.length} QC controls`
+  });
+
+  saveJSON(STORE_KEYS.runs, runs);
+  saveJSON(STORE_KEYS.qc, qcControls);
+  saveJSON(STORE_KEYS.audit, audit);
+  saveJSON(STORE_KEYS.settings, { facility: 'ACME Biologics — QC Lab', analyst: 'System' });
+}
+
+/* ============================================================
+   ICONS (inline SVG)
+   ============================================================ */
+const Icon = {
+  Dashboard: () => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>,
+  Beaker: () => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 3h6M10 3v6L4 19a2 2 0 0 0 2 3h12a2 2 0 0 0 2-3l-6-10V3"/></svg>,
+  Chart: () => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 5-5"/></svg>,
+  Report: () => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>,
+  Plus: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M12 5v14M5 12h14"/></svg>,
+  Download: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>,
+  Trash: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>,
+  Edit: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>,
+  Check: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M20 6L9 17l-5-5"/></svg>,
+  Warn: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0zM12 9v4M12 17h.01"/></svg>,
+  X: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M18 6L6 18M6 6l12 12"/></svg>,
+};
+
+/* ============================================================
+   STATUS BADGE
+   ============================================================ */
+function StatusBadge({ status, children }) {
+  const cls = status === 'pass' ? 'status-pass' : status === 'warn' ? 'status-warn' : 'status-fail';
+  return <span className={`px-2 py-0.5 rounded text-xs font-semibold ${cls}`}>{children}</span>;
+}
+
+/* ============================================================
+   KPI CARD
+   ============================================================ */
+function KpiCard({ title, value, unit, trend, color = 'cyan', sub }) {
+  const colorMap = {
+    cyan: 'border-cyan-200 text-cyan-700',
+    emerald: 'border-emerald-200 text-emerald-700',
+    amber: 'border-amber-200 text-amber-700',
+    rose: 'border-rose-200 text-rose-700',
+  };
+  return (
+    <div className={`kpi-card bg-white rounded-lg border ${colorMap[color]} p-4 shadow-sm`}>
+      <div className="text-xs uppercase tracking-wide text-slate-500 font-semibold">{title}</div>
+      <div className="mt-2 flex items-baseline gap-1">
+        <span className="text-3xl font-bold mono">{value}</span>
+        {unit && <span className="text-sm text-slate-500">{unit}</span>}
+      </div>
+      {sub && <div className="text-xs text-slate-500 mt-1">{sub}</div>}
+      {trend !== undefined && (
+        <div className={`text-xs mt-2 font-medium ${trend >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+          {trend >= 0 ? '↑' : '↓'} {Math.abs(trend).toFixed(1)}% vs prev period
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ============================================================
+   TOAST
+   ============================================================ */
+function Toast({ message, type = 'success' }) {
+  const color = type === 'success' ? 'bg-emerald-600' : type === 'warn' ? 'bg-amber-600' : 'bg-rose-600';
+  return (
+    <div className={`toast-enter fixed bottom-6 right-6 ${color} text-white px-4 py-3 rounded-md shadow-lg text-sm font-medium z-50`}>
+      {message}
+    </div>
+  );
+}
+
+/* ============================================================
+   VIEW: DASHBOARD
+   ============================================================ */
+function DashboardView({ runs, qcControls, onNav }) {
+  const last30 = useMemo(() => {
+    const cutoff = Date.now() - 30*24*60*60*1000;
+    return runs.filter(r => new Date(r.timestamp).getTime() >= cutoff);
+  }, [runs]);
+
+  const avgViability = useMemo(() => {
+    const v = last30.filter(r => r.assayType === 'Cell Viability').map(r => r.values.viability);
+    return v.length ? round(mean(v), 1) : 0;
+  }, [last30]);
+
+  const avgZPrime = useMemo(() => {
+    const cellViab = last30.filter(r => r.assayType === 'Cell Viability').map(r => r.values.viability);
+    if (cellViab.length < 4) return 0;
+    const half = Math.floor(cellViab.length/2);
+    const pos = cellViab.slice(0, half);
+    const neg = cellViab.slice(half);
+    return round(zPrime(pos, neg).z, 3);
+  }, [last30]);
+
+  const qcViolations = useMemo(() => {
+    let count = 0;
+    qcControls.forEach(c => {
+      const vals = c.values.map(v => v.value);
+      count += westgardViolations(vals).length;
+    });
+    return count;
+  }, [qcControls]);
+
+  const totalAssays = runs.length;
+
+  const recentRuns = useMemo(() =>
+    [...runs].sort((a,b) => new Date(b.timestamp) - new Date(a.timestamp)).slice(0, 10),
+  [runs]);
+
+  const overallStatus = avgViability >= 80 && qcViolations < 5 ? 'pass'
+    : avgViability >= 70 && qcViolations < 15 ? 'warn' : 'fail';
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-2xl font-bold text-slate-900">Quality Overview</h2>
+          <p className="text-sm text-slate-500">Real-time QC monitoring · 21 CFR Part 11 ready</p>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="pulse-dot"></span>
+          <span className="text-sm text-slate-600">Live</span>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-4 gap-4">
+        <KpiCard title="Avg Cell Viability" value={avgViability} unit="%" color="emerald" sub="Last 30 days" />
+        <KpiCard title="Z-prime (avg)" value={avgZPrime} color="cyan" sub="Viability assay" />
+        <KpiCard title="QC Violations" value={qcViolations} color={qcViolations > 10 ? 'rose' : qcViolations > 0 ? 'amber' : 'emerald'} sub="Westgard rules" />
+        <KpiCard title="Total Assays" value={totalAssays} color="cyan" sub="All time" />
+      </div>
+
+      <div className="bg-white rounded-lg border border-slate-200 shadow-sm">
+        <div className="px-5 py-3 border-b border-slate-200 flex items-center justify-between">
+          <h3 className="font-semibold text-slate-900">Recent Runs</h3>
+          <button onClick={() => onNav('entry')} className="text-sm text-cyan-700 hover:underline flex items-center gap-1">
+            <Icon.Plus /> New Entry
+          </button>
+        </div>
+        <div className="overflow-x-auto scrollbar-thin">
+          <table className="lab-data">
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Sample ID</th>
+                <th>Assay</th>
+                <th>Batch</th>
+                <th>Operator</th>
+                <th>Result</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {recentRuns.length === 0 && (
+                <tr><td colSpan="7" className="text-center text-slate-400 py-8">No runs yet. Use "Seed Demo Data" to populate.</td></tr>
+              )}
+              {recentRuns.map(r => {
+                let result = '—';
+                if (r.assayType === 'Cell Viability') result = `${r.values.viability}%`;
+                else if (r.assayType === 'Flow Cytometry') result = `${r.values.pctPositive}%`;
+                else if (r.assayType === 'ELISA') result = `${r.values.concentration} ng/mL`;
+                else if (r.assayType === 'qPCR') result = `ΔCt ${r.values.deltaCt}`;
+                return (
+                  <tr key={r.id}>
+                    <td className="mono text-xs">{fmtDate(r.timestamp)}</td>
+                    <td className="mono text-xs">{r.sampleId}</td>
+                    <td>{r.assayType}</td>
+                    <td className="mono text-xs">{r.batch}</td>
+                    <td className="mono text-xs">{r.operator}</td>
+                    <td className="mono text-xs">{result}</td>
+                    <td><StatusBadge status={overallStatus}>●</StatusBadge></td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   VIEW: ASSAY ENTRY
+   ============================================================ */
+function AssayEntryView({ runs, setRuns, audit, setAudit, pushToast }) {
+  const [tab, setTab] = useState('Cell Viability');
+  const [form, setForm] = useState({});
+  const [editingId, setEditingId] = useState(null);
+
+  const assayTypes = ['Cell Viability', 'Flow Cytometry', 'ELISA', 'qPCR'];
+
+  useEffect(() => {
+    setForm({});
+    setEditingId(null);
+  }, [tab]);
+
+  const update = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+  const handleSave = () => {
+    if (!form.sampleId) {
+      pushToast('Sample ID required', 'warn');
+      return;
+    }
+    let values = {};
+    let valid = true;
+    switch(tab) {
+      case 'Cell Viability':
+        if (!form.viability) valid = false;
+        values = { viability: parseFloat(form.viability), totalCells: parseInt(form.totalCells) || 0 };
+        break;
+      case 'Flow Cytometry':
+        if (!form.marker || !form.pctPositive) valid = false;
+        values = { marker: form.marker, pctPositive: parseFloat(form.pctPositive), mfi: parseFloat(form.mfi) || 0 };
+        break;
+      case 'ELISA':
+        if (!form.od450) valid = false;
+        values = { plateId: form.plateId, well: form.well, od450: parseFloat(form.od450), concentration: parseFloat(form.concentration) || 0 };
+        break;
+      case 'qPCR':
+        if (!form.ctTarget || !form.ctHousekeeping) valid = false;
+        const ctT = parseFloat(form.ctTarget);
+        const ctH = parseFloat(form.ctHousekeeping);
+        values = { target: form.target, ctTarget: ctT, ctHousekeeping: ctH,
+          deltaCt: round(ctT - ctH, 2), efficiency: parseFloat(form.efficiency) || 1.0 };
+        break;
+    }
+    if (!valid) {
+      pushToast('Please fill all required fields', 'warn');
+      return;
+    }
+    if (editingId) {
+      setRuns(prevRuns => prevRuns.map(r => r.id === editingId ? { ...r, values, qcFlags: [] } : r));
+      setAudit(prevAudit => [...prevAudit, { timestamp: nowISO(), action: 'EDIT_RUN',
+        user: 'Analyst', details: `Edited ${tab} run ${form.sampleId}` }]);
+      pushToast('Run updated');
+    } else {
+      const rec = {
+        id: uid(), timestamp: form.timestamp || nowISO(),
+        assayType: tab, sampleId: form.sampleId,
+        batch: form.batch || 'N/A', operator: form.operator || 'XX',
+        values, qcFlags: []
+      };
+      setRuns(prevRuns => [rec, ...prevRuns]);
+      setAudit(prevAudit => [...prevAudit, { timestamp: nowISO(), action: 'NEW_RUN',
+        user: 'Analyst', details: `Added ${tab} run ${form.sampleId}` }]);
+      pushToast('Run saved');
+    }
+    setForm({});
+    setEditingId(null);
+  };
+
+  const handleEdit = (r) => {
+    setTab(r.assayType);
+    setEditingId(r.id);
+    setForm({ ...r.values, sampleId: r.sampleId, batch: r.batch, operator: r.operator, timestamp: r.timestamp });
+  };
+
+  const handleDelete = (id) => {
+    if (!confirm('Delete this run? This will be logged in the audit trail.')) return;
+    setRuns(prevRuns => prevRuns.filter(r => r.id !== id));
+    setAudit(prevAudit => [...prevAudit, { timestamp: nowISO(), action: 'DELETE_RUN',
+      user: 'Analyst', details: `Deleted run ${id}` }]);
+    pushToast('Run deleted', 'warn');
+  };
+
+  const fieldClass = "w-full px-3 py-2 border border-slate-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-cyan-500";
+  const labelClass = "block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wide";
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h2 className="text-2xl font-bold text-slate-900">Assay Entry</h2>
+        <p className="text-sm text-slate-500">Record experimental data — auto-saved to local audit trail</p>
+      </div>
+
+      <div className="bg-white rounded-lg border border-slate-200 shadow-sm">
+        <div className="border-b border-slate-200 flex">
+          {assayTypes.map(t => (
+            <button key={t} onClick={() => setTab(t)}
+              className={`px-5 py-3 text-sm ${tab === t ? 'tab-active' : 'text-slate-600 hover:text-slate-900'}`}>
+              {t}
+            </button>
+          ))}
+        </div>
+        <div className="p-6">
+          <div className="grid grid-cols-3 gap-4">
+            <div>
+              <label className={labelClass}>Sample ID *</label>
+              <input className={fieldClass} placeholder="e.g. CV-2401" value={form.sampleId||''} onChange={e=>update('sampleId', e.target.value)} />
+            </div>
+            <div>
+              <label className={labelClass}>Batch / Lot</label>
+              <input className={fieldClass} placeholder="L2401-A" value={form.batch||''} onChange={e=>update('batch', e.target.value)} />
+            </div>
+            <div>
+              <label className={labelClass}>Operator Initials</label>
+              <input className={fieldClass} maxLength={3} placeholder="JD" value={form.operator||''} onChange={e=>update('operator', e.target.value.toUpperCase())} />
+            </div>
+          </div>
+
+          {tab === 'Cell Viability' && (
+            <div className="grid grid-cols-2 gap-4 mt-4">
+              <div>
+                <label className={labelClass}>Viability (%) *</label>
+                <input type="number" step="0.1" className={fieldClass} value={form.viability||''} onChange={e=>update('viability', e.target.value)} />
+              </div>
+              <div>
+                <label className={labelClass}>Total Cells</label>
+                <input type="number" className={fieldClass} value={form.totalCells||''} onChange={e=>update('totalCells', e.target.value)} />
+              </div>
+            </div>
+          )}
+
+          {tab === 'Flow Cytometry' && (
+            <div className="grid grid-cols-3 gap-4 mt-4">
+              <div>
+                <label className={labelClass}>Marker *</label>
+                <select className={fieldClass} value={form.marker||''} onChange={e=>update('marker', e.target.value)}>
+                  <option value="">—</option>
+                  {['CD3','CD4','CD8','CD19','CD56'].map(m => <option key={m}>{m}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className={labelClass}>% Positive *</label>
+                <input type="number" step="0.01" className={fieldClass} value={form.pctPositive||''} onChange={e=>update('pctPositive', e.target.value)} />
+              </div>
+              <div>
+                <label className={labelClass}>MFI</label>
+                <input type="number" className={fieldClass} value={form.mfi||''} onChange={e=>update('mfi', e.target.value)} />
+              </div>
+            </div>
+          )}
+
+          {tab === 'ELISA' && (
+            <div className="grid grid-cols-4 gap-4 mt-4">
+              <div>
+                <label className={labelClass}>Plate ID</label>
+                <input className={fieldClass} value={form.plateId||''} onChange={e=>update('plateId', e.target.value)} />
+              </div>
+              <div>
+                <label className={labelClass}>Well</label>
+                <input className={fieldClass} placeholder="A1" value={form.well||''} onChange={e=>update('well', e.target.value)} />
+              </div>
+              <div>
+                <label className={labelClass}>OD450 *</label>
+                <input type="number" step="0.0001" className={fieldClass} value={form.od450||''} onChange={e=>update('od450', e.target.value)} />
+              </div>
+              <div>
+                <label className={labelClass}>Concentration (ng/mL)</label>
+                <input type="number" step="0.01" className={fieldClass} value={form.concentration||''} onChange={e=>update('concentration', e.target.value)} />
+              </div>
+            </div>
+          )}
+
+          {tab === 'qPCR' && (
+            <div className="grid grid-cols-4 gap-4 mt-4">
+              <div>
+                <label className={labelClass}>Target Gene *</label>
+                <select className={fieldClass} value={form.target||''} onChange={e=>update('target', e.target.value)}>
+                  <option value="">—</option>
+                  {['GAPDH','ACTB','TNF','IL6','BRCA1','TP53'].map(g => <option key={g}>{g}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className={labelClass}>Ct Target *</label>
+                <input type="number" step="0.01" className={fieldClass} value={form.ctTarget||''} onChange={e=>update('ctTarget', e.target.value)} />
+              </div>
+              <div>
+                <label className={labelClass}>Ct Housekeeping *</label>
+                <input type="number" step="0.01" className={fieldClass} value={form.ctHousekeeping||''} onChange={e=>update('ctHousekeeping', e.target.value)} />
+              </div>
+              <div>
+                <label className={labelClass}>Efficiency</label>
+                <input type="number" step="0.01" className={fieldClass} placeholder="1.00" value={form.efficiency||''} onChange={e=>update('efficiency', e.target.value)} />
+              </div>
+              {form.ctTarget && form.ctHousekeeping && (
+                <div className="col-span-4 bg-cyan-50 border border-cyan-200 rounded p-3 text-sm">
+                  <span className="font-semibold text-cyan-900">ΔCt (auto):</span>{' '}
+                  <span className="mono text-cyan-700">{(parseFloat(form.ctTarget) - parseFloat(form.ctHousekeeping)).toFixed(2)}</span>
+                </div>
+              )}
+            </div>
+          )}
+
+          <div className="flex justify-end gap-2 mt-6">
+            {editingId && (
+              <button onClick={() => { setForm({}); setEditingId(null); }}
+                className="btn px-4 py-2 text-sm text-slate-600 hover:bg-slate-100 rounded">
+                Cancel
+              </button>
+            )}
+            <button onClick={handleSave}
+              className="btn px-5 py-2 bg-cyan-600 hover:bg-cyan-700 text-white rounded text-sm font-medium">
+              {editingId ? 'Update Run' : 'Save Run'}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div className="bg-white rounded-lg border border-slate-200 shadow-sm">
+        <div className="px-5 py-3 border-b border-slate-200">
+          <h3 className="font-semibold text-slate-900">Recent {tab} Entries</h3>
+        </div>
+        <div className="overflow-x-auto scrollbar-thin">
+          <table className="lab-data">
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Sample</th>
+                <th>Batch</th>
+                <th>Op</th>
+                <th>Result</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {runs.filter(r => r.assayType === tab).slice(0, 20).map(r => (
+                <tr key={r.id}>
+                  <td className="mono text-xs">{fmtDate(r.timestamp)}</td>
+                  <td className="mono text-xs">{r.sampleId}</td>
+                  <td className="mono text-xs">{r.batch}</td>
+                  <td className="mono text-xs">{r.operator}</td>
+                  <td className="mono text-xs">
+                    {r.assayType === 'Cell Viability' && `${r.values.viability}%`}
+                    {r.assayType === 'Flow Cytometry' && `${r.values.marker} ${r.values.pctPositive}%`}
+                    {r.assayType === 'ELISA' && `OD ${r.values.od450} → ${r.values.concentration} ng/mL`}
+                    {r.assayType === 'qPCR' && `${r.values.target} ΔCt ${r.values.deltaCt}`}
+                  </td>
+                  <td>
+                    <div className="flex gap-1">
+                      <button onClick={() => handleEdit(r)} className="p-1 hover:bg-slate-100 rounded text-slate-600" title="Edit">
+                        <Icon.Edit />
+                      </button>
+                      <button onClick={() => handleDelete(r.id)} className="p-1 hover:bg-rose-50 rounded text-rose-600" title="Delete">
+                        <Icon.Trash />
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+              {runs.filter(r => r.assayType === tab).length === 0 && (
+                <tr><td colSpan="6" className="text-center text-slate-400 py-6">No {tab} entries yet</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   LEVEY-JENNINGS CHART (custom SVG)
+   ============================================================ */
+function LeveyJenningsChart({ control, width = 720, height = 360 }) {
+  if (!control || !control.values.length) {
+    return <div className="text-slate-400 text-sm p-8 text-center">No QC data available</div>;
+  }
+  const padding = { top: 20, right: 20, bottom: 50, left: 60 };
+  const w = width - padding.left - padding.right;
+  const h = height - padding.top - padding.bottom;
+
+  const values = control.values.map(v => v.value);
+  const m = control.targetMean;
+  const sd = control.targetSD;
+
+  const yMin = Math.min(m - 4*sd, ...values);
+  const yMax = Math.max(m + 4*sd, ...values);
+  const yRange = yMax - yMin;
+  const yPad = yRange * 0.05;
+  const yLo = yMin - yPad;
+  const yHi = yMax + yPad;
+
+  const xStep = w / Math.max(1, values.length - 1);
+  const yScale = (v) => padding.top + h - ((v - yLo) / (yHi - yLo)) * h;
+
+  const violations = westgardViolations(values);
+  const violationIdx = new Set();
+  violations.forEach(v => v.indices.forEach(i => violationIdx.add(i)));
+
+  const yTicks = [];
+  for (let s = -4; s <= 4; s++) yTicks.push(s);
+
+  return (
+    <svg width={width} height={height} className="lj-chart">
+      {yTicks.map(s => (
+        <g key={s}>
+          <line x1={padding.left} y1={yScale(m + s*sd)} x2={padding.left + w} y2={yScale(m + s*sd)}
+            stroke={s === 0 ? '#0f172a' : s === 2 || s === -2 ? '#fbbf24' : s === 3 || s === -3 ? '#e11d48' : '#e2e8f0'}
+            strokeWidth={s === 0 ? 1.5 : s === 2 || s === -2 ? 0.8 : s === 3 || s === -3 ? 0.8 : 0.5}
+            strokeDasharray={s === 0 ? '0' : '3 3'} opacity={s === 0 ? 0.8 : 0.6} />
+          <text x={padding.left - 10} y={yScale(m + s*sd) + 4} textAnchor="end" fontSize="10" fill="#64748b" className="mono">
+            {s === 0 ? 'μ' : `${s > 0 ? '+' : ''}${s}σ`}
+          </text>
+          <text x={padding.left + w + 6} y={yScale(m + s*sd) + 4} fontSize="10" fill="#64748b" className="mono">
+            {round(m + s*sd, 2)}
+          </text>
+        </g>
+      ))}
+
+      {control.values.map((v, i) => {
+        if (i % Math.max(1, Math.floor(control.values.length / 6)) !== 0 && i !== control.values.length - 1) return null;
+        return (
+          <text key={i} x={padding.left + i*xStep} y={height - 15} textAnchor="middle" fontSize="10" fill="#64748b">
+            {new Date(v.date).toLocaleDateString('en-US', { month:'short', day:'numeric' })}
+          </text>
+        );
+      })}
+
+      <polyline
+        fill="none" stroke="#0891b2" strokeWidth="1.5" opacity="0.5"
+        points={values.map((v, i) => `${padding.left + i*xStep},${yScale(v)}`).join(' ')}
+      />
+
+      {values.map((v, i) => {
+        const isViolation = violationIdx.has(i);
+        const color = isViolation ? '#e11d48' : '#0891b2';
+        return (
+          <g key={i}>
+            <circle cx={padding.left + i*xStep} cy={yScale(v)} r={isViolation ? 5 : 3.5}
+              fill={isViolation ? '#fee2e2' : '#fff'} stroke={color} strokeWidth="1.5" />
+            <title>{`Date: ${fmtDate(control.values[i].date)}\nValue: ${round(v, 3)}\nSD: ${round((v-m)/sd, 2)}σ`}</title>
+          </g>
+        );
+      })}
+
+      <text x={padding.left} y={14} fontSize="12" fontWeight="600" fill="#0f172a">
+        {control.name} · μ={round(m, 2)} · σ={round(sd, 3)}
+      </text>
+    </svg>
+  );
+}
+
+/* ============================================================
+   VIEW: QC CHARTS
+   ============================================================ */
+function QCChartsView({ qcControls }) {
+  const [selectedQC, setSelectedQC] = useState(qcControls[0]?.id || '');
+  const [posMean, setPosMean] = useState(80);
+  const [posSD, setPosSD] = useState(2);
+  const [negMean, setNegMean] = useState(10);
+  const [negSD, setNegSD] = useState(2);
+
+  useEffect(() => {
+    if (qcControls[0] && !selectedQC) setSelectedQC(qcControls[0].id);
+  }, [qcControls]);
+
+  const control = qcControls.find(c => c.id === selectedQC);
+
+  useEffect(() => {
+    if (control) {
+      setPosMean(round(control.targetMean, 1));
+      setPosSD(round(control.targetSD, 2));
+    }
+  }, [selectedQC]);
+
+  const zCalc = (() => {
+    const denom = Math.abs(posMean - negMean);
+    if (denom === 0) return { z: 0, quality: zPrimeQuality(0) };
+    const zv = 1 - (3 * (posSD + negSD)) / denom;
+    return { z: zv, quality: zPrimeQuality(zv) };
+  })();
+
+  const violations = control ? westgardViolations(control.values.map(v => v.value)) : [];
+  const values = control ? control.values.map(v => v.value) : [];
+  const regression = control && control.values.length > 1 ?
+    linearRegression(control.values.map((v,i) => ({ x: i, y: v.value }))) : { slope: 0, r2: 0, intercept: 0 };
+
+  const fieldClass = "w-full px-3 py-2 border border-slate-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-cyan-500 mono";
+  const labelClass = "block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wide";
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h2>QC Charts &amp; Statistical Analysis</h2>
+        <p className="text-sm text-slate-500">Levey-Jennings control charts · Z-prime · Westgard rules</p>
+      </div>
+
+      <div className="grid grid-cols-3 gap-4">
+        {/* Z-PRIME PANEL */}
+        <div className="bg-white rounded-lg border border-slate-200 shadow-sm p-5">
+          <h3 className="font-semibold text-slate-900 mb-3">Z-prime Factor</h3>
+          <div className="text-xs text-slate-500 mb-3 font-mono">
+            Z' = 1 − (3·(σ₊ + σ₋)) / |μ₊ − μ₋|
+          </div>
+          <div className="space-y-2">
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className={labelClass}>μ₊ (Pos Mean)</label>
+                <input type="number" step="0.1" className={fieldClass} value={posMean} onChange={e=>setPosMean(parseFloat(e.target.value)||0)} />
+              </div>
+              <div>
+                <label className={labelClass}>σ₊ (Pos SD)</label>
+                <input type="number" step="0.01" className={fieldClass} value={posSD} onChange={e=>setPosSD(parseFloat(e.target.value)||0)} />
+              </div>
+              <div>
+                <label className={labelClass}>μ₋ (Neg Mean)</label>
+                <input type="number" step="0.1" className={fieldClass} value={negMean} onChange={e=>setNegMean(parseFloat(e.target.value)||0)} />
+              </div>
+              <div>
+                <label className={labelClass}>σ₋ (Neg SD)</label>
+                <input type="number" step="0.01" className={fieldClass} value={negSD} onChange={e=>setNegSD(parseFloat(e.target.value)||0)} />
+              </div>
+            </div>
+          </div>
+          <div className="mt-4 p-4 bg-slate-50 rounded border border-slate-200">
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="text-xs text-slate-500">Z-prime</div>
+                <div className="text-3xl font-bold mono text-slate-900">{round(zCalc.z, 3)}</div>
+              </div>
+              <span className={`px-3 py-1 rounded-full text-xs font-bold ${zCalc.quality.color}`}>
+                {zCalc.quality.label}
+              </span>
+            </div>
+            <div className="mt-2 text-xs text-slate-500 leading-relaxed">
+              <strong>Reference:</strong> Z' &lt; 0 = fail, 0–0.5 = marginal, 0.5–0.7 = acceptable, &gt; 0.7 = excellent assay discrimination.
+            </div>
+          </div>
+        </div>
+
+        {/* WESTGARD PANEL */}
+        <div className="bg-white rounded-lg border border-slate-200 shadow-sm p-5">
+          <h3 className="font-semibold text-slate-900 mb-3">Westgard Rules</h3>
+          <div className="text-xs text-slate-500 mb-3">Evaluated on last {control?.values.length || 0} control values</div>
+          {['1_3s','2_2s','R_4s','4_1s','10_x'].map(rule => {
+            const v = violations.find(x => x.rule === rule);
+            return (
+              <div key={rule} className="flex items-start gap-2 py-1.5 text-sm border-b border-slate-100 last:border-0">
+                <span className={`mt-0.5 ${v ? 'text-rose-600' : 'text-emerald-600'}`}>
+                  {v ? <Icon.X /> : <Icon.Check />}
+                </span>
+                <div className="flex-1">
+                  <div className="font-mono font-semibold text-xs">{rule}</div>
+                  {v && <div className="text-xs text-rose-700">{v.msg}</div>}
+                </div>
+              </div>
+            );
+          })}
+          <div className="mt-3 pt-3 border-t border-slate-200 text-xs text-slate-500">
+            Total violations: <span className="font-bold text-slate-900">{violations.length}</span>
+          </div>
+        </div>
+
+        {/* TREND PANEL */}
+        <div className="bg-white rounded-lg border border-slate-200 shadow-sm p-5">
+          <h3 className="font-semibold text-slate-900 mb-3">Trend Analysis</h3>
+          {control ? (
+            <div className="space-y-3 text-sm">
+              <div className="flex justify-between">
+                <span className="text-slate-600">Slope (per run)</span>
+                <span className="mono font-semibold">{round(regression.slope, 4)}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-600">R²</span>
+                <span className="mono font-semibold">{round(regression.r2, 3)}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-600">Current Mean</span>
+                <span className="mono font-semibold">{round(mean(values), 3)}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-600">Current SD</span>
+                <span className="mono font-semibold">{round(stdev(values), 3)}</span>
+              </div>
+              <div className="pt-3 border-t border-slate-200">
+                <div className="text-slate-600 text-xs mb-1">Predicted Next Value</div>
+                <div className="text-2xl font-bold mono text-cyan-700">
+                  {round(regression.intercept + regression.slope * values.length, 3)}
+                </div>
+                <div className="text-xs text-slate-500 mt-1">
+                  95% CI: ±{round(stdev(values) * 1.96, 3)}
+                </div>
+              </div>
+              <div className="pt-2 text-xs text-slate-500">
+                {regression.slope > 0.05 ? '↑ Upward drift detected' :
+                 regression.slope < -0.05 ? '↓ Downward drift detected' :
+                 '→ Stable trend'}
+              </div>
+            </div>
+          ) : <div className="text-slate-400 text-sm">No data</div>}
+        </div>
+      </div>
+
+      {/* LEVEY-JENNINGS CHART */}
+      <div className="bg-white rounded-lg border border-slate-200 shadow-sm p-5">
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="font-semibold text-slate-900">Levey-Jennings Control Chart</h3>
+          <select className="px-3 py-1.5 border border-slate-300 rounded text-sm"
+            value={selectedQC} onChange={e=>setSelectedQC(e.target.value)}>
+            {qcControls.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
+        </div>
+        <div className="grid-bg rounded">
+          <LeveyJenningsChart control={control} />
+        </div>
+        <div className="mt-3 text-xs text-slate-500 flex items-center gap-4">
+          <span className="flex items-center gap-1"><span className="inline-block w-3 h-0.5 bg-slate-900"></span> Mean</span>
+          <span className="flex items-center gap-1"><span className="inline-block w-3 border-t border-dashed border-amber-400"></span> ±2SD Warning</span>
+          <span className="flex items-center gap-1"><span className="inline-block w-3 h-0.5 bg-rose-500"></span> ±3SD Control</span>
+          <span className="flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-full bg-white border-2 border-cyan-600"></span> In Control</span>
+          <span className="flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-full bg-rose-100 border-2 border-rose-600"></span> Violation</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   VIEW: REPORTS
+   ============================================================ */
+function ReportsView({ runs, qcControls, audit, settings, setSettings, pushToast }) {
+  const [from, setFrom] = useState(new Date(Date.now() - 30*24*60*60*1000).toISOString().slice(0,10));
+  const [to, setTo] = useState(new Date().toISOString().slice(0,10));
+  const [filterAssay, setFilterAssay] = useState('All');
+  const [filterOp, setFilterOp] = useState('All');
+  const [signer, setSigner] = useState(settings.analyst || 'Lab Director');
+  const [generating, setGenerating] = useState(false);
+  const reportRef = useRef(null);
+
+  const operators = [...new Set(runs.map(r => r.operator))];
+
+  const filtered = useMemo(() => {
+    const fromTs = new Date(from).getTime();
+    const toTs = new Date(to).getTime() + 24*60*60*1000;
+    return runs.filter(r => {
+      const t = new Date(r.timestamp).getTime();
+      if (t < fromTs || t > toTs) return false;
+      if (filterAssay !== 'All' && r.assayType !== filterAssay) return false;
+      if (filterOp !== 'All' && r.operator !== filterOp) return false;
+      return true;
+    });
+  }, [runs, from, to, filterAssay, filterOp]);
+
+  const summary = useMemo(() => {
+    const byAssay = {};
+    filtered.forEach(r => {
+      if (!byAssay[r.assayType]) byAssay[r.assayType] = { count: 0, values: [] };
+      byAssay[r.assayType].count++;
+      if (r.assayType === 'Cell Viability') byAssay[r.assayType].values.push(r.values.viability);
+      else if (r.assayType === 'Flow Cytometry') byAssay[r.assayType].values.push(r.values.pctPositive);
+      else if (r.assayType === 'ELISA') byAssay[r.assayType].values.push(r.values.concentration);
+      else if (r.assayType === 'qPCR') byAssay[r.assayType].values.push(r.values.deltaCt);
+    });
+    return byAssay;
+  }, [filtered]);
+
+  const exportCSV = () => {
+    const headers = ['Date','Sample ID','Assay','Batch','Operator','Result'];
+    const rows = filtered.map(r => {
+      let result = '';
+      if (r.assayType === 'Cell Viability') result = `${r.values.viability}%`;
+      else if (r.assayType === 'Flow Cytometry') result = `${r.values.marker} ${r.values.pctPositive}%`;
+      else if (r.assayType === 'ELISA') result = `OD ${r.values.od450} = ${r.values.concentration} ng/mL`;
+      else if (r.assayType === 'qPCR') result = `${r.values.target} dCt ${r.values.deltaCt}`;
+      return [fmtDateTime(r.timestamp), r.sampleId, r.assayType, r.batch, r.operator, result];
+    });
+    const csv = [headers, ...rows].map(r => r.map(c => `"${c}"`).join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `labmetrics_data_${from}_${to}.csv`;
+    a.click(); URL.revokeObjectURL(url);
+    pushToast('CSV exported');
+  };
+
+  const generatePDF = async () => {
+    if (!reportRef.current) return;
+    setGenerating(true);
+    try {
+      const { jsPDF } = window.jspdf;
+      const pdf = new jsPDF('p', 'pt', 'letter');
+      const pageW = pdf.internal.pageSize.getWidth();
+      const pageH = pdf.internal.pageSize.getHeight();
+      const margin = 36;
+
+      pdf.setFontSize(20);
+      pdf.setFont(undefined, 'bold');
+      pdf.text('LabMetrics QC Report', pageW/2, 80, { align: 'center' });
+      pdf.setFontSize(12);
+      pdf.setFont(undefined, 'normal');
+      pdf.text(settings.facility || 'ACME Biologics', pageW/2, 105, { align: 'center' });
+
+      pdf.setFontSize(10);
+      pdf.text(`Report Period: ${fmtDate(from)} — ${fmtDate(to)}`, margin, 160);
+      pdf.text(`Generated: ${fmtDateTime(nowISO())}`, margin, 178);
+      pdf.text(`Records: ${filtered.length}`, margin, 196);
+      pdf.text(`Prepared by: ${signer}`, margin, 214);
+
+      pdf.setLineWidth(0.5);
+      pdf.line(margin, 280, pageW - margin, 280);
+      pdf.setFontSize(9);
+      pdf.text('Electronic Signature', margin, 295);
+      pdf.text(`Signed by: ${signer}`, margin, 308);
+      pdf.text(`Timestamp: ${nowISO()}`, margin, 320);
+      pdf.text('This report was generated electronically and constitutes a controlled document (21 CFR Part 11).',
+        margin, 360, { maxWidth: pageW - 2*margin });
+
+      pdf.addPage();
+      pdf.setFontSize(14);
+      pdf.setFont(undefined, 'bold');
+      pdf.text('Summary Statistics', margin, 60);
+      pdf.setFontSize(10);
+      pdf.setFont(undefined, 'normal');
+
+      let y = 90;
+      Object.entries(summary).forEach(([assay, data]) => {
+        pdf.setFont(undefined, 'bold');
+        pdf.text(assay, margin, y);
+        pdf.setFont(undefined, 'normal');
+        y += 18;
+        pdf.text(`  Count: ${data.count}`, margin, y); y += 14;
+        if (data.values.length) {
+          pdf.text(`  Mean: ${round(mean(data.values), 3)}`, margin, y); y += 14;
+          pdf.text(`  SD:   ${round(stdev(data.values), 3)}`, margin, y); y += 14;
+          pdf.text(`  Min:  ${round(Math.min(...data.values), 3)}`, margin, y); y += 14;
+          pdf.text(`  Max:  ${round(Math.max(...data.values), 3)}`, margin, y); y += 20;
+        }
+        y += 6;
+      });
+
+      pdf.addPage();
+      pdf.setFontSize(14);
+      pdf.setFont(undefined, 'bold');
+      pdf.text('Raw Data', margin, 60);
+      pdf.setFontSize(8);
+      pdf.setFont(undefined, 'normal');
+
+      const colW = [110, 80, 80, 50, 50, 150];
+      const cols = ['Date','Sample','Assay','Batch','Op','Result'];
+      let x = margin;
+      y = 80;
+      cols.forEach((c, i) => { pdf.text(c, x, y); x += colW[i]; });
+      y += 12;
+      pdf.setLineWidth(0.3);
+      pdf.line(margin, y - 4, pageW - margin, y - 4);
+
+      filtered.slice(0, 50).forEach(r => {
+        if (y > pageH - 50) { pdf.addPage(); y = 60; }
+        x = margin;
+        let result = '';
+        if (r.assayType === 'Cell Viability') result = `${r.values.viability}%`;
+        else if (r.assayType === 'Flow Cytometry') result = `${r.values.marker} ${r.values.pctPositive}%`;
+        else if (r.assayType === 'ELISA') result = `OD ${r.values.od450}`;
+        else if (r.assayType === 'qPCR') result = `${r.values.target} dCt ${r.values.deltaCt}`;
+        [fmtDate(r.timestamp), r.sampleId, r.assayType, r.batch, r.operator, result]
+          .forEach((v, i) => { pdf.text(String(v), x, y); x += colW[i]; });
+        y += 12;
+      });
+
+      if (filtered.length > 50) {
+        pdf.text(`... and ${filtered.length - 50} more records (export CSV for full data)`,
+          margin, y + 20);
+      }
+
+      const pageCount = pdf.internal.getNumberOfPages();
+      for (let i = 1; i <= pageCount; i++) {
+        pdf.setPage(i);
+        pdf.setFontSize(8);
+        pdf.setTextColor(120);
+        pdf.text(`LabMetrics v1.0 | ${settings.facility} | Page ${i} of ${pageCount}`,
+          pageW/2, pageH - 20, { align: 'center' });
+        pdf.setTextColor(0);
+      }
+
+      pdf.save(`LabMetrics_Report_${from}_${to}.pdf`);
+      pushToast('PDF generated successfully');
+    } catch (err) {
+      console.error(err);
+      pushToast('PDF generation failed', 'fail');
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  const fieldClass = "px-3 py-2 border border-slate-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-cyan-500";
+  const labelClass = "block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wide";
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-2xl font-bold text-slate-900">Reports &amp; Export</h2>
+          <p className="text-sm text-slate-500">Regulatory-compliant PDF reports · Audit trail included</p>
+        </div>
+        <div className="flex gap-2">
+          <button onClick={exportCSV} className="btn flex items-center gap-1 px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-sm font-medium">
+            <Icon.Download /> Export CSV
+          </button>
+          <button onClick={generatePDF} disabled={generating}
+            className="btn flex items-center gap-1 px-4 py-2 bg-cyan-600 hover:bg-cyan-700 text-white rounded text-sm font-medium disabled:opacity-50">
+            {generating ? 'Generating…' : <><Icon.Download /> Generate PDF</>}
+          </button>
+        </div>
+      </div>
+
+      <div className="bg-white rounded-lg border border-slate-200 shadow-sm p-4">
+        <div className="grid grid-cols-5 gap-3">
+          <div>
+            <label className={labelClass}>From</label>
+            <input type="date" className={fieldClass + ' w-full'} value={from} onChange={e=>setFrom(e.target.value)} />
+          </div>
+          <div>
+            <label className={labelClass}>To</label>
+            <input type="date" className={fieldClass + ' w-full'} value={to} onChange={e=>setTo(e.target.value)} />
+          </div>
+          <div>
+            <label className={labelClass}>Assay Type</label>
+            <select className={fieldClass + ' w-full'} value={filterAssay} onChange={e=>setFilterAssay(e.target.value)}>
+              <option>All</option>
+              {['Cell Viability','Flow Cytometry','ELISA','qPCR'].map(a => <option key={a}>{a}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className={labelClass}>Operator</label>
+            <select className={fieldClass + ' w-full'} value={filterOp} onChange={e=>setFilterOp(e.target.value)}>
+              <option>All</option>
+              {operators.map(o => <option key={o}>{o}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className={labelClass}>Facility</label>
+            <input className={fieldClass + ' w-full'} value={settings.facility}
+              onChange={e=>setSettings({...settings, facility: e.target.value})} />
+          </div>
+        </div>
+        <div className="mt-3 pt-3 border-t border-slate-200 flex items-center gap-3">
+          <label className={labelClass + ' mb-0'}>Electronic Signature (name):</label>
+          <input className={fieldClass + ' flex-1 max-w-xs'} value={signer} onChange={e=>setSigner(e.target.value)} />
+          <span className="text-xs text-slate-500">+ timestamp = binding signature per 21 CFR Part 11</span>
+        </div>
+      </div>
+
+      <div ref={reportRef} className="bg-white rounded-lg border border-slate-200 shadow-sm p-8 space-y-6">
+        <div className="text-center border-b border-slate-300 pb-4">
+          <div className="text-xs text-slate-500 uppercase tracking-widest">Quality Control Report</div>
+          <h2 className="text-2xl font-bold mt-1">{settings.facility}</h2>
+          <div className="text-sm text-slate-600 mt-1">{fmtDate(from)} — {fmtDate(to)}</div>
+        </div>
+
+        <div>
+          <h3 className="font-semibold text-slate-900 mb-2">Summary Statistics</h3>
+          <table className="lab-data">
+            <thead>
+              <tr><th>Assay</th><th>N</th><th>Mean</th><th>SD</th><th>Min</th><th>Max</th></tr>
+            </thead>
+            <tbody>
+              {Object.entries(summary).map(([assay, d]) => (
+                <tr key={assay}>
+                  <td>{assay}</td>
+                  <td className="mono">{d.count}</td>
+                  <td className="mono">{d.values.length ? round(mean(d.values), 3) : '—'}</td>
+                  <td className="mono">{d.values.length > 1 ? round(stdev(d.values), 3) : '—'}</td>
+                  <td className="mono">{d.values.length ? round(Math.min(...d.values), 3) : '—'}</td>
+                  <td className="mono">{d.values.length ? round(Math.max(...d.values), 3) : '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        <div>
+          <h3 className="font-semibold text-slate-900 mb-2">Raw Data ({filtered.length} records)</h3>
+          <div className="max-h-96 overflow-y-auto scrollbar-thin border border-slate-200 rounded">
+            <table className="lab-data">
+              <thead className="sticky top-0">
+                <tr>
+                  <th>#</th><th>Date</th><th>Sample</th><th>Assay</th><th>Batch</th><th>Op</th><th>Result</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filtered.map((r, i) => {
+                  let result = '';
+                  if (r.assayType === 'Cell Viability') result = `${r.values.viability}%`;
+                  else if (r.assayType === 'Flow Cytometry') result = `${r.values.marker} ${r.values.pctPositive}%`;
+                  else if (r.assayType === 'ELISA') result = `OD ${r.values.od450} = ${r.values.concentration} ng/mL`;
+                  else if (r.assayType === 'qPCR') result = `${r.values.target} ΔCt ${r.values.deltaCt}`;
+                  return (
+                    <tr key={r.id}>
+                      <td className="mono text-xs text-slate-500">{i+1}</td>
+                      <td className="mono text-xs">{fmtDateTime(r.timestamp)}</td>
+                      <td className="mono text-xs">{r.sampleId}</td>
+                      <td>{r.assayType}</td>
+                      <td className="mono text-xs">{r.batch}</td>
+                      <td className="mono text-xs">{r.operator}</td>
+                      <td className="mono text-xs">{result}</td>
+                    </tr>
+                  );
+                })}
+                {filtered.length === 0 && (
+                  <tr><td colSpan="7" className="text-center text-slate-400 py-6">No records match the filters</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div className="border-t border-slate-300 pt-4">
+          <h3 className="font-semibold text-slate-900 mb-2">Audit Trail (last 10 entries)</h3>
+          <table className="lab-data">
+            <thead><tr><th>Timestamp</th><th>Action</th><th>User</th><th>Details</th></tr></thead>
+            <tbody>
+              {audit.slice(-10).reverse().map((a, i) => (
+                <tr key={i}>
+                  <td className="mono text-xs">{fmtDateTime(a.timestamp)}</td>
+                  <td><StatusBadge status={a.action.includes('DELETE') ? 'fail' : a.action.includes('SEED') ? 'warn' : 'pass'}>{a.action}</StatusBadge></td>
+                  <td>{a.user}</td>
+                  <td className="text-xs">{a.details}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        <div className="border-t border-slate-300 pt-4 grid grid-cols-2 gap-8 text-xs text-slate-600">
+          <div>
+            <div className="border-b border-slate-400 pb-1 mb-1">&nbsp;</div>
+            <div>Electronic Signature: <strong>{signer}</strong></div>
+            <div>Date/Time: {fmtDateTime(nowISO())}</div>
+          </div>
+          <div>
+            <div className="border-b border-slate-400 pb-1 mb-1">&nbsp;</div>
+            <div>Reviewed By: ____________________</div>
+            <div>Date: __________________</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   APP
+   ============================================================ */
+function App() {
+  const [view, setView] = useState('dashboard');
+  const [runs, setRuns] = useState([]);
+  const [qcControls, setQcControls] = useState([]);
+  const [audit, setAudit] = useState([]);
+  const [settings, setSettings] = useState({ facility: 'ACME Biologics — QC Lab', analyst: 'Lab Director' });
+  const [toast, setToast] = useState(null);
+  const [confirmSeed, setConfirmSeed] = useState(false);
+
+  useEffect(() => {
+    const stored = {
+      runs: loadJSON(STORE_KEYS.runs, null),
+      qc: loadJSON(STORE_KEYS.qc, null),
+      audit: loadJSON(STORE_KEYS.audit, null),
+      settings: loadJSON(STORE_KEYS.settings, null),
+    };
+    if (stored.runs === null) {
+      seedDemoData();
+    }
+    setRuns(loadJSON(STORE_KEYS.runs, []));
+    setQcControls(loadJSON(STORE_KEYS.qc, []));
+    setAudit(loadJSON(STORE_KEYS.audit, []));
+    if (stored.settings) setSettings(stored.settings);
+  }, []);
+
+  useEffect(() => { if (runs.length || qcControls.length) saveJSON(STORE_KEYS.runs, runs); }, [runs]);
+  useEffect(() => { if (qcControls.length) saveJSON(STORE_KEYS.qc, qcControls); }, [qcControls]);
+  useEffect(() => { if (audit.length) saveJSON(STORE_KEYS.audit, audit); }, [audit]);
+  useEffect(() => { saveJSON(STORE_KEYS.settings, settings); }, [settings]);
+
+  const pushToast = (message, type = 'success') => {
+    setToast({ message, type, id: Date.now() });
+    setTimeout(() => setToast(null), 3000);
+  };
+
+  const handleSeed = () => {
+    seedDemoData();
+    setRuns(loadJSON(STORE_KEYS.runs, []));
+    setQcControls(loadJSON(STORE_KEYS.qc, []));
+    setAudit(loadJSON(STORE_KEYS.audit, []));
+    setConfirmSeed(false);
+    pushToast('Demo data seeded');
+  };
+
+  const navItems = [
+    { id: 'dashboard', label: 'Dashboard', icon: <Icon.Dashboard /> },
+    { id: 'entry', label: 'Assay Entry', icon: <Icon.Beaker /> },
+    { id: 'charts', label: 'QC Charts', icon: <Icon.Chart /> },
+    { id: 'reports', label: 'Reports', icon: <Icon.Report /> },
+  ];
+
+  return (
+    <div className="min-h-screen flex flex-col">
+      {/* HEADER */}
+      <header className="bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <div className="w-9 h-9 rounded bg-gradient-to-br from-cyan-500 to-cyan-700 flex items-center justify-center text-white font-bold">
+            LM
+          </div>
+          <div>
+            <div className="font-bold text-slate-900">LabMetrics</div>
+            <div className="text-xs text-slate-500">{settings.facility}</div>
+          </div>
+        </div>
+        <div className="flex items-center gap-4">
+          <div className="text-xs text-slate-500 mono">{fmtDateTime(nowISO())}</div>
+          <span className="text-xs px-2 py-1 bg-emerald-50 text-emerald-700 rounded font-semibold border border-emerald-200">
+            ✓ 21 CFR Part 11 Ready
+          </span>
+          {runs.length === 0 && (
+            <button onClick={() => setConfirmSeed(true)}
+              className="btn px-3 py-1.5 bg-amber-500 hover:bg-amber-600 text-white rounded text-xs font-medium">
+              Seed Demo Data
+            </button>
+          )}
+        </div>
+      </header>
+
+      <div className="flex flex-1">
+        {/* SIDEBAR */}
+        <nav className="w-56 bg-white border-r border-slate-200 p-3 flex-shrink-0">
+          <div className="space-y-1">
+            {navItems.map(item => (
+              <button key={item.id} onClick={() => setView(item.id)}
+                className={`nav-item w-full flex items-center gap-2 px-3 py-2 rounded text-sm font-medium ${
+                  view === item.id ? 'active' : 'text-slate-600 hover:bg-slate-100'
+                }`}>
+                {item.icon}
+                {item.label}
+              </button>
+            ))}
+          </div>
+          <div className="mt-6 pt-6 border-t border-slate-200 text-xs text-slate-500 space-y-1">
+            <div className="font-semibold text-slate-700 uppercase tracking-wide mb-2">System</div>
+            <div className="flex justify-between"><span>Runs</span><span className="mono font-semibold">{runs.length}</span></div>
+            <div className="flex justify-between"><span>QC Controls</span><span className="mono font-semibold">{qcControls.length}</span></div>
+            <div className="flex justify-between"><span>Audit Entries</span><span className="mono font-semibold">{audit.length}</span></div>
+          </div>
+          <div className="mt-6 pt-6 border-t border-slate-200">
+            <button onClick={() => setConfirmSeed(true)}
+              className="w-full text-xs px-2 py-1.5 border border-slate-300 text-slate-600 rounded hover:bg-slate-50">
+              Reset Demo Data
+            </button>
+          </div>
+        </nav>
+
+        {/* MAIN */}
+        <main className="flex-1 p-6 overflow-auto scrollbar-thin">
+          {view === 'dashboard' && <DashboardView runs={runs} qcControls={qcControls} onNav={setView} />}
+          {view === 'entry' && <AssayEntryView runs={runs} setRuns={setRuns} audit={audit} setAudit={setAudit} pushToast={pushToast} />}
+          {view === 'charts' && <QCChartsView qcControls={qcControls} />}
+          {view === 'reports' && <ReportsView runs={runs} qcControls={qcControls} audit={audit} settings={settings} setSettings={setSettings} pushToast={pushToast} />}
+        </main>
+      </div>
+
+      {/* FOOTER */}
+      <footer className="bg-white border-t border-slate-200 px-6 py-2 flex items-center justify-between text-xs text-slate-500">
+        <div>LabMetrics v1.0 · GLP/GMP Documentation Dashboard · {settings.facility}</div>
+        <div className="mono">Last sync: {fmtDateTime(nowISO())} · Sample N={runs.length}</div>
+      </footer>
+
+      {/* TOAST */}
+      {toast && <Toast message={toast.message} type={toast.type} />}
+
+      {/* CONFIRM MODAL */}
+      {confirmSeed && (
+        <div className="fixed inset-0 bg-slate-900/50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-lg shadow-xl p-6 max-w-md w-full mx-4">
+            <h3 className="font-bold text-slate-900 text-lg mb-2">Reset Demo Data?</h3>
+            <p className="text-sm text-slate-600 mb-4">
+              This will replace all current runs and QC data with synthetic demo data.
+              All existing entries will be lost.
+            </p>
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setConfirmSeed(false)}
+                className="px-4 py-2 text-sm text-slate-600 hover:bg-slate-100 rounded">
+                Cancel
+              </button>
+              <button onClick={handleSeed}
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded text-sm font-medium">
+                Reset &amp; Reseed
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
